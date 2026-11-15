@@ -45,6 +45,8 @@ This bot gives leadership one consistent view at the same time every week:
 
 ## Architecture
 
+![n8n HubSpot Probability-Weighted Forecast Bot Workflow](https://raw.githubusercontent.com/dhrobinsystems/n8n-hubspot-deal-stage-probability-weighted-forecast-bot/main/workflow-overview.png)
+
 ```mermaid
 flowchart LR
     A[Weekly Monday Cron<br/>0 8 * * 1] --> B[HubSpot Deal Aggregator<br/><i>pipelines · open deals · closed won · owners</i>]
