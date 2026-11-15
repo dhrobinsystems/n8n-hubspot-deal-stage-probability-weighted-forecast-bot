@@ -1,0 +1,662 @@
+{
+  "name": "HubSpot Probability-Weighted Forecast Bot – dhRobin Systems",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## HubSpot Probability-Weighted Forecast Bot\n**dhRobin Systems · MIT · provided as-is (see DISCLAIMER.md)**\n\nSafe defaults: `DRY_RUN=true`, `SANDBOX_MODE=true`.\nSlack posts happen only when **both** are `false`.\n\n⚠️ **HubSpot Deal Aggregator has pinned fictional data.**\nManual runs use the pin and skip the node. **Unpin it** before you test against a live HubSpot account.\nScheduled (active) runs ignore pinned data.\n\nSchedule: Mondays 08:00 in the workflow timezone (Settings → Timezone).\nNo credentials or real data are stored in this file.",
+        "height": 460,
+        "width": 420,
+        "color": 7
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000001",
+      "name": "Read Me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -520,
+        -280
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000002",
+      "name": "Weekly Monday Cron",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// =====================================================================\n// HubSpot Deal Aggregator\n// n8n-hubspot-deal-stage-probability-weighted-forecast-bot\n// dhRobin Systems · MIT License · Provided as-is, see DISCLAIMER.md\n// ---------------------------------------------------------------------\n// Mode: Run Once for All Items\n// Live mode:\n//   1. GET  /crm/v3/pipelines/deals            → stages, probabilities, closed flags\n//   2. POST /crm/v3/objects/deals/search       → open deals in the forecast horizon (paged)\n//   3. POST /crm/v3/objects/deals/search       → closed-won deals this fiscal quarter (paged)\n//   4. GET  /crm/v3/owners (optional)          → owner display names\n// Sandbox mode: returns a fixed, fictional dataset and calls nothing.\n// Output: ONE item { meta, periods, pipelines, deals, closedWon, owners, previousSnapshot }\n// =====================================================================\n\n// ---------- 1. Configuration ----------\nconst ENV = (() => { try { return $env || {}; } catch (e) { return {}; } })();\nconst env = (key, fallback) => {\n  const v = ENV[key];\n  return v === undefined || v === null || String(v).trim() === '' ? fallback : String(v).trim();\n};\nconst isOn = (key) => env(key, 'true').toLowerCase() !== 'false';\nconst csv  = (key, fallback) => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst int  = (key, fallback) => { const n = parseInt(env(key, String(fallback)), 10); return Number.isFinite(n) ? n : fallback; };\n\nconst HUBSPOT_API_BASE = 'https://api.hubapi.com'; // fixed: the token is never sent anywhere else\nconst CONFIG = {\n  SANDBOX_MODE:            isOn('SANDBOX_MODE'),\n  HUBSPOT_ACCESS_TOKEN:    env('HUBSPOT_ACCESS_TOKEN', ''),\n  PIPELINE_IDS:            csv('PIPELINE_IDS', '').filter((p) => /^[A-Za-z0-9_-]{1,64}$/.test(p)),\n  HORIZON_QUARTERS:        Math.min(8, Math.max(1, int('HORIZON_QUARTERS', 2))),\n  FISCAL_YEAR_START_MONTH: Math.min(12, Math.max(1, int('FISCAL_YEAR_START_MONTH', 1))),\n  MAX_DEALS:               Math.min(10000, Math.max(100, int('MAX_DEALS', 5000))),\n  PAGE_DELAY_MS:           Math.max(0, int('PAGE_DELAY_MS', 250)),\n  INCLUDE_OWNER_NAMES:     isOn('INCLUDE_OWNER_NAMES'),\n  AMOUNT_PROPERTY:         /^[a-z0-9_]{1,100}$/.test(env('AMOUNT_PROPERTY', 'amount_in_home_currency')) ? env('AMOUNT_PROPERTY', 'amount_in_home_currency') : 'amount_in_home_currency',\n  REPORT_DATE_OVERRIDE:    env('REPORT_DATE_OVERRIDE', ''),\n};\nconst SAMPLE_AS_OF = '2026-11-16T08:00:00.000Z'; // fixed so sandbox output is reproducible\n\nconst looksPlaceholder = (v) => /YOUR_|PLACEHOLDER|CHANGE_ME|REPLACE_/i.test(String(v || ''));\nif (!CONFIG.SANDBOX_MODE && (!CONFIG.HUBSPOT_ACCESS_TOKEN || looksPlaceholder(CONFIG.HUBSPOT_ACCESS_TOKEN))) {\n  throw new Error('SANDBOX_MODE=false requires a real HUBSPOT_ACCESS_TOKEN environment variable.');\n}\n\n// ---------- 2. Period maths (UTC, fiscal-year aware) ----------\nconst asOfRaw = CONFIG.REPORT_DATE_OVERRIDE || (CONFIG.SANDBOX_MODE ? SAMPLE_AS_OF : new Date().toISOString());\nconst asOf = new Date(asOfRaw);\nif (isNaN(asOf.getTime())) throw new Error('REPORT_DATE_OVERRIDE is not a valid ISO date.');\n\nconst utc = (y, m, d = 1) => new Date(Date.UTC(y, m, d));            // m is 0-based and may overflow\nconst addMonths = (date, n) => utc(date.getUTCFullYear(), date.getUTCMonth() + n, date.getUTCDate());\nfunction fiscalQuarter(date, offsetQuarters = 0) {\n  const fsm = CONFIG.FISCAL_YEAR_START_MONTH - 1;                    // 0-based fiscal start month\n  const monthsIntoFy = (date.getUTCMonth() - fsm + 12) % 12;\n  const fyStartYear = date.getUTCMonth() >= fsm ? date.getUTCFullYear() : date.getUTCFullYear() - 1;\n  const qIndex = Math.floor(monthsIntoFy / 3) + offsetQuarters;      // may exceed 3 for later quarters\n  const start = utc(fyStartYear, fsm + qIndex * 3, 1);\n  const end = new Date(addMonths(start, 3).getTime() - 1);\n  const startMonthsIntoFy = (start.getUTCMonth() - fsm + 12) % 12;\n  const startFyYear = start.getUTCMonth() >= fsm ? start.getUTCFullYear() : start.getUTCFullYear() - 1;\n  const fyLabel = CONFIG.FISCAL_YEAR_START_MONTH === 1 ? startFyYear : startFyYear + 1;\n  return { label: `Q${Math.floor(startMonthsIntoFy / 3) + 1} FY${fyLabel}`, start: start.toISOString(), end: end.toISOString() };\n}\nfunction isoWeekKey(date) {\n  const d = utc(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());\n  const day = d.getUTCDay() || 7;\n  d.setUTCDate(d.getUTCDate() + 4 - day);\n  const yearStart = utc(d.getUTCFullYear(), 0, 1);\n  const week = Math.ceil(((d - yearStart) / 86400000 + 1) / 7);\n  return `${d.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;\n}\nconst todayStart = utc(asOf.getUTCFullYear(), asOf.getUTCMonth(), asOf.getUTCDate());\nconst monthStart = utc(asOf.getUTCFullYear(), asOf.getUTCMonth(), 1);\nconst periods = {\n  asOf: asOf.toISOString(),\n  today: todayStart.toISOString(),\n  weekKey: isoWeekKey(asOf),\n  month: { start: monthStart.toISOString(), end: new Date(addMonths(monthStart, 1).getTime() - 1).toISOString() },\n  quarter: fiscalQuarter(asOf, 0),\n  nextQuarter: fiscalQuarter(asOf, 1),\n  horizonEnd: fiscalQuarter(asOf, CONFIG.HORIZON_QUARTERS - 1).end,\n  horizonQuarters: CONFIG.HORIZON_QUARTERS,\n  fiscalYearStartMonth: CONFIG.FISCAL_YEAR_START_MONTH,\n};\n\n// ---------- 3. Helpers ----------\nconst sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\nconst redact = (t) => String(t || '').replace(/Bearer\\s+[A-Za-z0-9\\-_.=]+/gi, 'Bearer [REDACTED]').replace(/pat-[a-z0-9]{2,}-[A-Za-z0-9-]+/gi, '[REDACTED_TOKEN]').slice(0, 200);\nconst numOrNull = (v) => { if (v === null || v === undefined || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };\nconst isoOrNull = (v) => { if (!v) return null; const d = /^\\d+$/.test(String(v)) ? new Date(Number(v)) : new Date(String(v)); return isNaN(d.getTime()) ? null : d.toISOString(); };\n\nconst helpers = this.helpers;\nasync function hubspot(method, path, body) {\n  if (!helpers || typeof helpers.httpRequest !== 'function') throw new Error('this.helpers.httpRequest is not available in this n8n version.');\n  const options = { method, url: `${HUBSPOT_API_BASE}${path}`, json: true, timeout: 20000,\n    headers: { Authorization: `Bearer ${CONFIG.HUBSPOT_ACCESS_TOKEN}`, 'Content-Type': 'application/json' } };\n  if (body) options.body = body;\n  for (let attempt = 1; attempt <= 4; attempt++) {\n    try { return await helpers.httpRequest(options); }\n    catch (err) {\n      const status = Number(err?.httpCode || err?.statusCode || err?.response?.status) || null;\n      if ((status === 429 || (status && status >= 500)) && attempt < 4) { await sleep(1500 * attempt); continue; }\n      // Sanitised: endpoint path and status only. The full error never reaches logs or Slack.\n      throw new Error(`HubSpot ${method} ${path.split('?')[0]} failed (HTTP ${status || 'n/a'}): ${redact(err?.message)}`);\n    }\n  }\n}\n\nasync function searchAll(body) {\n  const out = [];\n  let after;\n  do {\n    const res = await hubspot('POST', '/crm/v3/objects/deals/search', { ...body, limit: 200, ...(after ? { after } : {}) });\n    for (const r of (res && res.results) || []) out.push(r);\n    after = res && res.paging && res.paging.next && res.paging.next.after;\n    if (out.length >= CONFIG.MAX_DEALS) { after = undefined; }\n    if (after && CONFIG.PAGE_DELAY_MS) await sleep(CONFIG.PAGE_DELAY_MS);\n  } while (after);\n  return out.slice(0, CONFIG.MAX_DEALS);\n}\n\nconst DEAL_PROPERTIES = ['dealname', 'amount', 'amount_in_home_currency', CONFIG.AMOUNT_PROPERTY, 'closedate', 'dealstage', 'pipeline',\n  'hubspot_owner_id', 'hs_deal_stage_probability', 'hs_lastmodifieddate', 'notes_last_updated', 'createdate'];\n\nfunction normalizeDeal(r) {\n  const p = (r && r.properties) || {};\n  const amount = numOrNull(p[CONFIG.AMOUNT_PROPERTY]) ?? numOrNull(p.amount);\n  return {\n    id: String(r.id),\n    name: String(p.dealname || `Deal ${r.id}`).slice(0, 120),\n    amount,\n    closeDate: isoOrNull(p.closedate),\n    pipelineId: p.pipeline ? String(p.pipeline) : null,\n    stageId: p.dealstage ? String(p.dealstage) : null,\n    ownerId: p.hubspot_owner_id ? String(p.hubspot_owner_id) : null,\n    dealProbability: numOrNull(p.hs_deal_stage_probability),\n    lastModified: isoOrNull(p.hs_lastmodifieddate),\n    lastActivity: isoOrNull(p.notes_last_updated),\n  };\n}\n\n// ---------- 4. Sandbox dataset (fictional) ----------\nfunction sampleDataset() {\n  const st = (id, label, probability, displayOrder, isClosed = false) => ({ id, label, probability, displayOrder, isClosed });\n  const pipelines = [\n    { id: 'default', label: 'New Business', displayOrder: 0, stages: [\n      st('appointmentscheduled', 'Discovery', 0.2, 0), st('qualifiedtobuy', 'Qualified', 0.4, 1),\n      st('presentationscheduled', 'Demo / Solution', 0.6, 2), st('decisionmakerboughtin', 'Decision Maker Bought-In', 0.8, 3),\n      st('contractsent', 'Contract Sent', 0.9, 4), st('closedwon', 'Closed Won', 1, 5, true), st('closedlost', 'Closed Lost', 0, 6, true) ] },\n    { id: 'PIPELINE_ID_RENEWALS', label: 'Renewals', displayOrder: 1, stages: [\n      st('STAGE_ID_RENEWAL_OPEN', 'Renewal Open', 0.5, 0), st('STAGE_ID_RENEWAL_NEGOTIATION', 'Negotiation', 0.75, 1),\n      st('STAGE_ID_RENEWAL_COMMITTED', 'Verbally Committed', 0.9, 2), st('STAGE_ID_RENEWAL_WON', 'Renewed', 1, 3, true), st('STAGE_ID_RENEWAL_LOST', 'Churned', 0, 4, true) ] },\n  ];\n  const d = (id, name, amount, closeDate, pipelineId, stageId, ownerId, lastModified, dealProbability = null) =>\n    ({ id, name: `${name} (fictional)`, amount, closeDate: closeDate ? `${closeDate}T00:00:00.000Z` : null, pipelineId, stageId, ownerId, dealProbability, lastModified: `${lastModified}T12:00:00.000Z`, lastActivity: null });\n  const deals = [\n    d('SMP-1001', 'Alpha Ltd - Platform',     120000, '2026-12-15', 'default', 'contractsent',          'OWNER_ID_1', '2026-11-13'),\n    d('SMP-1002', 'Bravo Inc - Expansion',     85000, '2026-11-28', 'default', 'decisionmakerboughtin', 'OWNER_ID_2', '2026-11-12'),\n    d('SMP-1003', 'Charlie GmbH - Pilot',      40000, '2026-11-05', 'default', 'presentationscheduled', 'OWNER_ID_1', '2026-10-01'),\n    d('SMP-1004', 'Delta Co - Enterprise',    250000, '2026-12-20', 'default', 'qualifiedtobuy',        'OWNER_ID_3', '2026-11-10'),\n    d('SMP-1005', 'Echo Partners - Starter',   18000, '2026-12-05', 'default', 'appointmentscheduled',  'OWNER_ID_2', '2026-11-14'),\n    d('SMP-1006', 'Foxtrot Labs - Platform',   95000, '2027-01-30', 'default', 'presentationscheduled', 'OWNER_ID_3', '2026-11-09'),\n    d('SMP-1007', 'Golf Health - Analytics',   60000, '2027-02-15', 'default', 'qualifiedtobuy',        'OWNER_ID_1', '2026-10-20'),\n    d('SMP-1008', 'Hotel Retail - Rollout',     null, '2026-12-10', 'default', 'appointmentscheduled',  'OWNER_ID_2', '2026-11-11'),\n    d('SMP-1009', 'India Logistics - Suite',   70000,         null, 'default', 'qualifiedtobuy',        'OWNER_ID_3', '2026-11-02'),\n    d('SMP-1010', 'Juliet Media - Add-on',     22000, '2026-11-30', 'default', 'contractsent',          'OWNER_ID_1', '2026-11-15'),\n    d('SMP-2001', 'Kilo Systems - Renewal',    48000, '2026-12-31', 'PIPELINE_ID_RENEWALS', 'STAGE_ID_RENEWAL_NEGOTIATION', 'OWNER_ID_2', '2026-11-06'),\n    d('SMP-2002', 'Lima Energy - Renewal',     36000, '2026-11-20', 'PIPELINE_ID_RENEWALS', 'STAGE_ID_RENEWAL_COMMITTED',   'OWNER_ID_3', '2026-11-13'),\n    d('SMP-2003', 'Mike Foods - Renewal',      30000, '2027-03-15', 'PIPELINE_ID_RENEWALS', 'STAGE_ID_RENEWAL_OPEN',        'OWNER_ID_1', '2026-11-03'),\n  ];\n  const closedWon = [\n    d('SMP-3001', 'Oscar Bank - Platform',    110000, '2026-10-14', 'default', 'closedwon', 'OWNER_ID_1', '2026-10-14'),\n    d('SMP-3002', 'Papa Telecom - Renewal',    42000, '2026-10-28', 'PIPELINE_ID_RENEWALS', 'STAGE_ID_RENEWAL_WON', 'OWNER_ID_2', '2026-10-28'),\n    d('SMP-3003', 'Quebec Edu - Starter',      15000, '2026-11-09', 'default', 'closedwon', 'OWNER_ID_3', '2026-11-09'),\n  ];\n  const owners = { OWNER_ID_1: 'Owner A (placeholder)', OWNER_ID_2: 'Owner B (placeholder)', OWNER_ID_3: 'Owner C (placeholder)' };\n  const previousSnapshot = { weekKey: '2026-W46', asOf: '2026-11-09T08:00:00.000Z', quarterLabel: 'Q4 FY2026',\n    quarterWeighted: 372500, openAmount: 812000, openCount: 12, closedWonQTD: 152000 };\n  return { pipelines, deals, closedWon, owners, previousSnapshot, sampleTarget: 450000 };\n}\n\n// ---------- 5. Live loaders ----------\nasync function loadPipelines() {\n  const res = await hubspot('GET', '/crm/v3/pipelines/deals');\n  return ((res && res.results) || []).filter((p) => !p.archived).map((p) => ({\n    id: String(p.id), label: String(p.label || p.id), displayOrder: Number(p.displayOrder) || 0,\n    stages: (p.stages || []).filter((s) => !s.archived).map((s) => ({\n      id: String(s.id), label: String(s.label || s.id), displayOrder: Number(s.displayOrder) || 0,\n      probability: Math.min(1, Math.max(0, Number(s.metadata && s.metadata.probability) || 0)),\n      isClosed: String(s.metadata && s.metadata.isClosed) === 'true',\n    })),\n  }));\n}\nasync function loadOwners() {\n  const owners = {};\n  let after;\n  do {\n    const res = await hubspot('GET', `/crm/v3/owners?limit=500${after ? `&after=${encodeURIComponent(after)}` : ''}`);\n    for (const o of (res && res.results) || []) owners[String(o.id)] = [o.firstName, o.lastName].filter(Boolean).join(' ') || `Owner ${o.id}`;\n    after = res && res.paging && res.paging.next && res.paging.next.after;\n  } while (after);\n  return owners;\n}\n\n// ---------- 6. Main ----------\nlet dataset; let source;\nif (CONFIG.SANDBOX_MODE) {\n  dataset = sampleDataset();\n  source = 'sandbox_sample';\n  // Mirror the live search filter: drop open deals that close after the horizon.\n  dataset.deals = dataset.deals.filter((x) => !x.closeDate || x.closeDate <= periods.horizonEnd);\n} else {\n  let pipelines = await loadPipelines();\n  if (CONFIG.PIPELINE_IDS.length) pipelines = pipelines.filter((p) => CONFIG.PIPELINE_IDS.includes(p.id));\n  if (!pipelines.length) throw new Error('No deal pipelines matched PIPELINE_IDS.');\n  const closedStageIds = pipelines.flatMap((p) => p.stages.filter((s) => s.isClosed).map((s) => s.id));\n  const wonStageIds = pipelines.flatMap((p) => p.stages.filter((s) => s.isClosed && s.probability >= 1).map((s) => s.id));\n  const pipelineFilter = { propertyName: 'pipeline', operator: 'IN', values: pipelines.map((p) => p.id) };\n  const openStage = closedStageIds.length ? [{ propertyName: 'dealstage', operator: 'NOT_IN', values: closedStageIds }] : [];\n  const horizonMs = String(new Date(periods.horizonEnd).getTime());\n  const sorts = [{ propertyName: 'hs_object_id', direction: 'ASCENDING' }];\n\n  const openRaw = await searchAll({\n    filterGroups: [\n      { filters: [pipelineFilter, ...openStage, { propertyName: 'closedate', operator: 'LTE', value: horizonMs }] },\n      { filters: [pipelineFilter, ...openStage, { propertyName: 'closedate', operator: 'NOT_HAS_PROPERTY' }] },\n    ],\n    properties: [...new Set(DEAL_PROPERTIES)], sorts,\n  });\n  const wonRaw = wonStageIds.length ? await searchAll({\n    filterGroups: [{ filters: [pipelineFilter, { propertyName: 'dealstage', operator: 'IN', values: wonStageIds },\n      { propertyName: 'closedate', operator: 'GTE', value: String(new Date(periods.quarter.start).getTime()) },\n      { propertyName: 'closedate', operator: 'LTE', value: String(asOf.getTime()) }] }],\n    properties: [...new Set(DEAL_PROPERTIES)], sorts,\n  }) : [];\n\n  let owners = {};\n  if (CONFIG.INCLUDE_OWNER_NAMES) { try { owners = await loadOwners(); } catch (e) { owners = {}; } } // optional scope\n\n  const sd = (() => { try { return $getWorkflowStaticData('global'); } catch (e) { return {}; } })();\n  const history = Object.values(sd.snapshots || {}).filter((s) => s && s.weekKey !== periods.weekKey).sort((a, b) => String(b.weekKey).localeCompare(String(a.weekKey)));\n\n  dataset = { pipelines, deals: openRaw.map(normalizeDeal), closedWon: wonRaw.map(normalizeDeal), owners, previousSnapshot: history[0] || null, sampleTarget: null };\n  source = 'hubspot_live';\n}\n\nreturn [{ json: {\n  meta: {\n    source,\n    generatedAt: new Date().toISOString(),\n    dealCount: dataset.deals.length,\n    closedWonCount: dataset.closedWon.length,\n    truncated: dataset.deals.length >= CONFIG.MAX_DEALS,\n    amountProperty: CONFIG.AMOUNT_PROPERTY,\n    sampleTarget: dataset.sampleTarget,\n  },\n  periods,\n  pipelines: dataset.pipelines,\n  deals: dataset.deals,\n  closedWon: dataset.closedWon,\n  owners: dataset.owners,\n  previousSnapshot: dataset.previousSnapshot,\n} }];\n"
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000003",
+      "name": "HubSpot Deal Aggregator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// =====================================================================\n// Forecast Calculator\n// n8n-hubspot-deal-stage-probability-weighted-forecast-bot\n// dhRobin Systems · MIT License · Provided as-is, see DISCLAIMER.md\n// ---------------------------------------------------------------------\n// Mode: Run Once for All Items · pure calculation, no network calls\n//   weighted(deal)      = amount × probability\n//   expected (E)        = Σ amount × p\n//   variance (Var)      = Σ amount² × p × (1 − p)     (independent Bernoulli outcomes)\n//   P10 / P90 range     = E ∓ 1.2816 × √Var            (normal approximation, floored at 0)\n//   projected quarter   = closed-won QTD + E(current-quarter open deals)\n//   coverage ratio      = open quarter pipeline ÷ (target − closed-won QTD)\n// =====================================================================\n\nconst ENV = (() => { try { return $env || {}; } catch (e) { return {}; } })();\nconst env = (key, fallback) => {\n  const v = ENV[key];\n  return v === undefined || v === null || String(v).trim() === '' ? fallback : String(v).trim();\n};\nconst num = (key, fallback) => { const n = parseFloat(env(key, String(fallback))); return Number.isFinite(n) ? n : fallback; };\nconst int = (key, fallback) => { const n = parseInt(env(key, String(fallback)), 10); return Number.isFinite(n) ? n : fallback; };\n\nconst data = $input.first().json;\n\nlet overrides = {};\nconst rawOverrides = env('STAGE_PROBABILITY_OVERRIDES_JSON', '');\nif (rawOverrides) {\n  try { overrides = JSON.parse(rawOverrides); } catch (e) { throw new Error('STAGE_PROBABILITY_OVERRIDES_JSON is not valid JSON.'); }\n  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) throw new Error('STAGE_PROBABILITY_OVERRIDES_JSON must be an object of { stageId: probability }.');\n}\n\nconst targetEnv = env('QUARTER_TARGET', '');\nconst CONFIG = {\n  PROBABILITY_SOURCE: env('PROBABILITY_SOURCE', 'stage').toLowerCase(),             // stage | deal_property\n  COMMIT_PROBABILITY: Math.min(1, Math.max(0, num('COMMIT_PROBABILITY', 0.8))),\n  STALE_DAYS:         Math.max(1, int('STALE_DAYS', 21)),\n  PAST_DUE_TREATMENT: env('PAST_DUE_TREATMENT', 'current_quarter').toLowerCase(),    // current_quarter | exclude\n  TOP_DEALS_COUNT:    Math.min(10, Math.max(0, int('TOP_DEALS_COUNT', 5))),\n  TOP_OWNERS_COUNT:   Math.min(15, Math.max(0, int('TOP_OWNERS_COUNT', 5))),\n  QUARTER_TARGET:     targetEnv !== '' && Number.isFinite(Number(targetEnv)) ? Number(targetEnv) : (data.meta && data.meta.sampleTarget) || null,\n};\nconst Z90 = 1.2816;\nconst round = (n) => Math.round(n * 100) / 100;\nconst ratio = (n) => Math.round(n * 10000) / 10000; // ratios keep 4 decimals\nconst clamp01 = (n) => Math.min(1, Math.max(0, n));\nconst p = data.periods;\nconst t = (iso) => (iso ? new Date(iso).getTime() : null);\n\n// ---------- Stage index ----------\nconst stageIndex = {};\nfor (const pl of data.pipelines || []) {\n  for (const s of pl.stages || []) {\n    stageIndex[s.id] = { pipelineId: pl.id, pipelineLabel: pl.label, pipelineOrder: pl.displayOrder, stageLabel: s.label, order: s.displayOrder, probability: s.probability, isClosed: s.isClosed };\n  }\n}\n\n// ---------- Per-deal enrichment ----------\nconst today = t(p.today); const monthEnd = t(p.month.end);\nconst qStart = t(p.quarter.start); const qEnd = t(p.quarter.end);\nconst nqStart = t(p.nextQuarter.start); const nqEnd = t(p.nextQuarter.end);\nconst staleCutoff = t(p.asOf) - CONFIG.STALE_DAYS * 86400000;\nconst owners = data.owners || {};\n\nconst enriched = (data.deals || []).map((d) => {\n  const stage = stageIndex[d.stageId] || null;\n  const flags = [];\n  if (!stage) flags.push('unknown_stage');\n  if (stage && stage.isClosed) flags.push('closed_stage_in_open_set');\n  let probability;\n  let probabilitySource;\n  if (d.stageId && overrides[d.stageId] !== undefined && Number.isFinite(Number(overrides[d.stageId]))) { probability = clamp01(Number(overrides[d.stageId])); probabilitySource = 'override'; }\n  else if (CONFIG.PROBABILITY_SOURCE === 'deal_property' && Number.isFinite(d.dealProbability)) { probability = clamp01(d.dealProbability); probabilitySource = 'deal_property'; }\n  else if (stage) { probability = clamp01(stage.probability); probabilitySource = 'stage'; }\n  else { probability = 0; probabilitySource = 'unknown_stage_zero'; }\n\n  const amount = Number.isFinite(d.amount) ? Math.max(0, d.amount) : 0;\n  if (!Number.isFinite(d.amount)) flags.push('missing_amount');\n  const close = t(d.closeDate);\n  let period;\n  if (close === null) { period = 'no_close_date'; flags.push('missing_close_date'); }\n  else if (close < today) { period = 'past_due'; flags.push('past_due'); }\n  else if (close <= monthEnd) period = 'this_month';\n  else if (close <= qEnd) period = 'this_quarter_later';\n  else if (close >= nqStart && close <= nqEnd) period = 'next_quarter';\n  else period = 'later';\n  const lastTouch = Math.max(t(d.lastActivity) || 0, t(d.lastModified) || 0);\n  if (lastTouch && lastTouch < staleCutoff) flags.push('stale');\n  const inQuarter = period === 'this_month' || period === 'this_quarter_later' || (period === 'past_due' && CONFIG.PAST_DUE_TREATMENT === 'current_quarter');\n\n  return {\n    id: d.id, name: d.name, amount, probability, probabilitySource, weighted: amount * probability,\n    pipelineId: stage ? stage.pipelineId : d.pipelineId, pipelineLabel: stage ? stage.pipelineLabel : (d.pipelineId || 'Unknown'),\n    stageId: d.stageId, stageLabel: stage ? stage.stageLabel : (d.stageId || 'Unknown'), stageOrder: stage ? stage.order : 999,\n    pipelineOrder: stage ? stage.pipelineOrder : 999,\n    ownerId: d.ownerId, ownerName: (d.ownerId && owners[d.ownerId]) || (d.ownerId ? `Owner ${d.ownerId}` : 'Unassigned'),\n    closeDate: d.closeDate, period, inQuarter, flags,\n  };\n}).filter((d) => !d.flags.includes('closed_stage_in_open_set'));\n\n// ---------- Aggregation helpers ----------\nconst agg = (list) => {\n  const amount = list.reduce((s, d) => s + d.amount, 0);\n  const weighted = list.reduce((s, d) => s + d.weighted, 0);\n  const variance = list.reduce((s, d) => s + d.amount * d.amount * d.probability * (1 - d.probability), 0);\n  const sigma = Math.sqrt(variance);\n  return { count: list.length, amount: round(amount), weighted: round(weighted), sigma: round(sigma),\n    p10: round(Math.max(0, weighted - Z90 * sigma)), p90: round(Math.min(amount, weighted + Z90 * sigma)) };\n};\nconst groupBy = (list, keyFn) => list.reduce((m, d) => { const k = keyFn(d); (m[k] = m[k] || []).push(d); return m; }, {});\n\n// ---------- Headline metrics ----------\nconst quarterDeals = enriched.filter((d) => d.inQuarter);\nconst quarterAgg = agg(quarterDeals);\nconst commit = round(quarterDeals.filter((d) => d.probability >= CONFIG.COMMIT_PROBABILITY).reduce((s, d) => s + d.amount, 0));\nconst closedWonQTD = round((data.closedWon || []).reduce((s, d) => s + (Number.isFinite(d.amount) ? d.amount : 0), 0));\nconst target = CONFIG.QUARTER_TARGET;\nconst projected = round(closedWonQTD + quarterAgg.weighted);\nconst remaining = target !== null ? target - closedWonQTD : null;\n\nconst quarter = {\n  label: p.quarter.label, start: p.quarter.start, end: p.quarter.end,\n  ...quarterAgg,\n  bestCase: round(closedWonQTD + quarterAgg.amount),\n  commit: round(closedWonQTD + commit),\n  closedWonQTD,\n  closedWonCount: (data.closedWon || []).length,\n  projected,\n  projectedP10: round(closedWonQTD + quarterAgg.p10),\n  projectedP90: round(closedWonQTD + quarterAgg.p90),\n  target,\n  attainment: target ? ratio(closedWonQTD / target) : null,\n  projectedAttainment: target ? ratio(projected / target) : null,\n  gapToTarget: target !== null ? round(target - projected) : null,\n  coverage: remaining !== null && remaining > 0 ? round(quarterAgg.amount / remaining) : null,\n  targetAlreadyMet: remaining !== null && remaining <= 0,\n  daysLeft: Math.max(0, Math.ceil((qEnd - t(p.asOf)) / 86400000)),\n};\n\nconst allAgg = agg(enriched);\nconst nextQuarter = { label: p.nextQuarter.label, ...agg(enriched.filter((d) => d.period === 'next_quarter')) };\n\nconst PERIOD_ORDER = [\n  ['past_due', 'Past due'], ['this_month', 'This month'], ['this_quarter_later', `Rest of ${p.quarter.label}`],\n  ['next_quarter', p.nextQuarter.label], ['later', 'Later in horizon'], ['no_close_date', 'No close date'],\n];\nconst periodGroups = groupBy(enriched, (d) => d.period);\nconst byPeriod = PERIOD_ORDER.map(([key, label]) => ({ key, label, ...agg(periodGroups[key] || []) })).filter((r) => r.count > 0);\n\nconst stageGroups = groupBy(enriched, (d) => `${d.pipelineId}::${d.stageId}`);\nconst byStage = Object.values(stageGroups).map((list) => ({\n  pipelineLabel: list[0].pipelineLabel, stageLabel: list[0].stageLabel, pipelineOrder: list[0].pipelineOrder, stageOrder: list[0].stageOrder,\n  probability: list[0].probability, ...agg(list),\n})).sort((a, b) => a.pipelineOrder - b.pipelineOrder || a.stageOrder - b.stageOrder);\n\nconst pipelineGroups = groupBy(enriched, (d) => d.pipelineId);\nconst byPipeline = Object.values(pipelineGroups).map((list) => ({\n  pipelineLabel: list[0].pipelineLabel, pipelineOrder: list[0].pipelineOrder, ...agg(list),\n  quarterWeighted: round(list.filter((d) => d.inQuarter).reduce((s, d) => s + d.weighted, 0)),\n})).sort((a, b) => a.pipelineOrder - b.pipelineOrder);\n\nconst ownerGroups = groupBy(quarterDeals, (d) => d.ownerName);\nconst byOwner = Object.entries(ownerGroups).map(([ownerName, list]) => ({ ownerName, ...agg(list) }))\n  .sort((a, b) => b.weighted - a.weighted).slice(0, CONFIG.TOP_OWNERS_COUNT);\n\nconst topDeals = [...quarterDeals].sort((a, b) => b.weighted - a.weighted).slice(0, CONFIG.TOP_DEALS_COUNT).map((d) => ({\n  id: d.id, name: d.name, amount: d.amount, probability: d.probability, weighted: round(d.weighted),\n  closeDate: d.closeDate, stageLabel: d.stageLabel, pipelineLabel: d.pipelineLabel, ownerName: d.ownerName, flags: d.flags,\n}));\nconst top3Weighted = [...quarterDeals].sort((a, b) => b.weighted - a.weighted).slice(0, 3).reduce((s, d) => s + d.weighted, 0);\n\nconst flagged = (flag) => enriched.filter((d) => d.flags.includes(flag));\nconst risk = (flag) => { const l = flagged(flag); return { count: l.length, amount: round(l.reduce((s, d) => s + d.amount, 0)) }; };\nconst risks = {\n  pastDue: risk('past_due'),\n  stale: { ...risk('stale'), days: CONFIG.STALE_DAYS },\n  missingAmount: risk('missing_amount'),\n  missingCloseDate: risk('missing_close_date'),\n  unknownStage: risk('unknown_stage'),\n  concentrationTop3: quarterAgg.weighted > 0 ? ratio(top3Weighted / quarterAgg.weighted) : null,\n};\n\n// ---------- Week over week ----------\nconst prev = data.previousSnapshot || null;\nconst delta = (now, before) => (Number.isFinite(before) ? { now, before, change: round(now - before), pct: before ? ratio((now - before) / before) : null } : null);\nconst wow = prev ? {\n  previousWeekKey: prev.weekKey,\n  sameQuarter: prev.quarterLabel === quarter.label,\n  quarterWeighted: prev.quarterLabel === quarter.label ? delta(quarter.weighted, prev.quarterWeighted) : null,\n  closedWonQTD: prev.quarterLabel === quarter.label ? delta(closedWonQTD, prev.closedWonQTD) : null,\n  openAmount: delta(allAgg.amount, prev.openAmount),\n  openCount: delta(allAgg.count, prev.openCount),\n} : null;\n\nconst snapshot = {\n  weekKey: p.weekKey, asOf: p.asOf, quarterLabel: quarter.label, quarterWeighted: quarter.weighted,\n  openAmount: allAgg.amount, openCount: allAgg.count, closedWonQTD, projected,\n};\n\nreturn [{ json: {\n  meta: { ...data.meta, probabilitySource: CONFIG.PROBABILITY_SOURCE, commitProbability: CONFIG.COMMIT_PROBABILITY, pastDueTreatment: CONFIG.PAST_DUE_TREATMENT, overridesApplied: Object.keys(overrides).length },\n  periods: p,\n  totals: allAgg,\n  quarter,\n  nextQuarter,\n  byPeriod,\n  byStage,\n  byPipeline,\n  byOwner,\n  topDeals,\n  risks,\n  wow,\n  snapshot,\n} }];\n"
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000004",
+      "name": "Forecast Calculator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// =====================================================================\n// Slack Block Kit Builder\n// n8n-hubspot-deal-stage-probability-weighted-forecast-bot\n// dhRobin Systems · MIT License · Provided as-is, see DISCLAIMER.md\n// ---------------------------------------------------------------------\n// Mode: Run Once for All Items\n// Turns the forecast into a Slack Block Kit message, one item per destination.\n// Webhook URLs are NEVER placed in item data. The publisher node reads them from\n// $env at request time, so they never appear in execution logs.\n// Emits `action`: post | dry_run_preview | skip_already_posted\n// =====================================================================\n\nconst ENV = (() => { try { return $env || {}; } catch (e) { return {}; } })();\nconst env = (key, fallback) => {\n  const v = ENV[key];\n  return v === undefined || v === null || String(v).trim() === '' ? fallback : String(v).trim();\n};\nconst isOn  = (key) => env(key, 'true').toLowerCase() !== 'false';\nconst optIn = (key) => env(key, 'false').toLowerCase() === 'true';\n\nconst CONFIG = {\n  DRY_RUN:          isOn('DRY_RUN'),\n  SANDBOX_MODE:     isOn('SANDBOX_MODE'),\n  FORCE_REPOST:     optIn('FORCE_REPOST'),\n  REPORT_TITLE:     env('REPORT_TITLE', 'Weekly Pipeline Forecast').slice(0, 100),\n  CURRENCY_CODE:    env('CURRENCY_CODE', 'USD').toUpperCase().slice(0, 3),\n  REPORT_TIMEZONE:  env('REPORT_TIMEZONE', 'UTC'),\n  SHOW_DEAL_NAMES:  isOn('SHOW_DEAL_NAMES'),\n  SHOW_OWNER_BREAKDOWN: isOn('SHOW_OWNER_BREAKDOWN'),\n  HUBSPOT_PORTAL_ID: /^\\d{1,12}$/.test(env('HUBSPOT_PORTAL_ID', '')) ? env('HUBSPOT_PORTAL_ID', '') : '',\n};\nconst EFFECTIVE_DRY_RUN = CONFIG.DRY_RUN || CONFIG.SANDBOX_MODE;\n\n// ---------- Destination validation (URLs are checked, never copied) ----------\nconst SLACK_HOOK = /^https:\\/\\/hooks\\.slack\\.com\\/services\\/[A-Za-z0-9_\\-/]+$/;\nconst destinations = [{ key: 'PRIMARY', envVar: 'SLACK_WEBHOOK_URL' }, { key: 'SECONDARY', envVar: 'SLACK_WEBHOOK_URL_SECONDARY' }]\n  .filter((d) => d.key === 'PRIMARY' || env(d.envVar, ''));\nif (!EFFECTIVE_DRY_RUN) {\n  for (const d of destinations) {\n    const url = env(d.envVar, '');\n    if (!SLACK_HOOK.test(url) || /YOUR_|PLACEHOLDER|REPLACE_/i.test(url)) throw new Error(`${d.envVar} is missing or is not a valid https://hooks.slack.com/services/... URL.`);\n  }\n}\n\n// ---------- Formatting helpers ----------\nconst f = $input.first().json;\nconst SYMBOLS = { USD: '$', EUR: '€', GBP: '£', JPY: '¥', INR: '₹', AUD: 'A$', CAD: 'C$', SGD: 'S$', BDT: '৳' };\nconst sym = SYMBOLS[CONFIG.CURRENCY_CODE] || `${CONFIG.CURRENCY_CODE} `;\nfunction money(n, compact = true) {\n  if (n === null || n === undefined || !Number.isFinite(n)) return '—';\n  const sign = n < 0 ? '−' : '';\n  const a = Math.abs(n);\n  if (compact && a >= 1e9) return `${sign}${sym}${(a / 1e9).toFixed(2)}B`;\n  if (compact && a >= 1e6) return `${sign}${sym}${(a / 1e6).toFixed(2)}M`;\n  if (compact && a >= 1e4) return `${sign}${sym}${(a / 1e3).toFixed(1)}K`;\n  return `${sign}${sym}${Math.round(a).toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',')}`;\n}\nconst pct = (n, digits = 0) => (n === null || n === undefined || !Number.isFinite(n) ? '—' : `${(n * 100).toFixed(digits)}%`);\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); // blocks <!channel>, links, mentions\nconst pad = (s, n, right = false) => { s = String(s); if (s.length > n) s = `${s.slice(0, n - 1)}…`; return right ? s.padStart(n) : s.padEnd(n); };\nconst arrow = (d) => (!d || d.change === 0 ? '■' : d.change > 0 ? '▲' : '▼');\nconst deltaText = (d, isMoney = true) => (!d ? '—' : `${arrow(d)} ${isMoney ? money(d.change) : (d.change > 0 ? `+${d.change}` : d.change)}${d.pct !== null ? ` (${d.pct > 0 ? '+' : ''}${pct(d.pct, 1)})` : ''}`);\nfunction dateLabel(iso) {\n  try { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: CONFIG.REPORT_TIMEZONE }); }\n  catch (e) { return String(iso).slice(0, 10); }\n}\nfunction timeLabel(iso) {\n  try { return new Date(iso).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: CONFIG.REPORT_TIMEZONE, timeZoneName: 'short' }); }\n  catch (e) { return String(iso).replace('T', ' ').slice(0, 16) + ' UTC'; }\n}\nconst plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;\nconst clip = (s, max = 2900) => (s.length > max ? `${s.slice(0, max - 20)}\\n… (truncated)` : s);\nconst codeTable = (lines) => clip(`\\`\\`\\`\\n${lines.join('\\n')}\\n\\`\\`\\``);\n\n// ---------- Blocks ----------\nconst q = f.quarter;\nconst isSample = f.meta.source === 'sandbox_sample';\nconst blocks = [];\nconst section = (text) => blocks.push({ type: 'section', text: { type: 'mrkdwn', text: clip(text) } });\nconst fields = (list) => blocks.push({ type: 'section', fields: list.slice(0, 10).map((t) => ({ type: 'mrkdwn', text: clip(t, 1900) })) });\nconst divider = () => blocks.push({ type: 'divider' });\nconst context = (text) => blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: clip(text, 2900) }] });\n\nblocks.push({ type: 'header', text: { type: 'plain_text', emoji: true, text: `📊 ${CONFIG.REPORT_TITLE} · ${q.label}`.slice(0, 150) } });\ncontext(`Week of *${dateLabel(f.periods.asOf)}* · Snapshot ${timeLabel(f.periods.asOf)} · ${q.daysLeft} days left in quarter${isSample ? ' · :test_tube: *SANDBOX – fictional data*' : ''}`);\n\nfields([\n  `*Weighted forecast (${esc(q.label)})*\\n${money(q.weighted)}`,\n  `*Projected quarter*\\n${money(q.projected)}${q.projectedAttainment !== null ? ` · ${pct(q.projectedAttainment)} of target` : ''}`,\n  `*Closed won QTD*\\n${money(q.closedWonQTD)} · ${plural(q.closedWonCount, 'deal', 'deals')}${q.attainment !== null ? ` · ${pct(q.attainment)}` : ''}`,\n  `*Quarter target*\\n${q.target !== null ? money(q.target) : 'not set'}${q.gapToTarget !== null ? ` · ${q.gapToTarget > 0 ? `gap ${money(q.gapToTarget)}` : `ahead by ${money(-q.gapToTarget)}`}` : ''}`,\n  `*Expected range (P10–P90)*\\n${money(q.projectedP10)} – ${money(q.projectedP90)}`,\n  `*Commit / Best case*\\n${money(q.commit)} / ${money(q.bestCase)}`,\n  `*Open pipeline in quarter*\\n${money(q.amount)} · ${plural(q.count, 'deal', 'deals')}`,\n  `*Coverage ratio*\\n${q.targetAlreadyMet ? 'target already met' : q.coverage !== null ? `${q.coverage.toFixed(2)}×` : '—'}`,\n]);\n\nif (f.wow) {\n  const w = f.wow;\n  section([\n    `*Week over week* (vs ${esc(w.previousWeekKey)})`,\n    `• Weighted forecast: ${w.sameQuarter ? deltaText(w.quarterWeighted) : '_new quarter, no comparison_'}`,\n    `• Closed won QTD: ${w.sameQuarter ? deltaText(w.closedWonQTD) : '—'}`,\n    `• Total open pipeline: ${deltaText(w.openAmount)}  ·  Open deals: ${deltaText(w.openCount, false)}`,\n  ].join('\\n'));\n}\ndivider();\n\nsection(`*By close period*\\n${codeTable([\n  `${pad('Period', 18)}${pad('Deals', 6, true)}${pad('Amount', 11, true)}${pad('Weighted', 11, true)}`,\n  ...f.byPeriod.map((r) => `${pad(r.label, 18)}${pad(r.count, 6, true)}${pad(money(r.amount), 11, true)}${pad(money(r.weighted), 11, true)}`),\n])}`);\n\nsection(`*By stage* (probability from ${esc(f.meta.probabilitySource === 'deal_property' ? 'deal probability property' : 'pipeline stage settings')})\\n${codeTable([\n  `${pad('Stage', 20)}${pad('Prob', 5, true)}${pad('#', 4, true)}${pad('Amount', 10, true)}${pad('Weighted', 10, true)}`,\n  ...f.byStage.map((r) => `${pad(`${f.byPipeline.length > 1 ? `${r.pipelineLabel.slice(0, 3)}·` : ''}${r.stageLabel}`, 20)}${pad(pct(r.probability), 5, true)}${pad(r.count, 4, true)}${pad(money(r.amount), 10, true)}${pad(money(r.weighted), 10, true)}`),\n])}`);\n\nif (f.byPipeline.length > 1) {\n  section(`*By pipeline*\\n${codeTable([\n    `${pad('Pipeline', 18)}${pad('#', 4, true)}${pad('Open', 10, true)}${pad('Weighted', 10, true)}${pad('In qtr', 10, true)}`,\n    ...f.byPipeline.map((r) => `${pad(r.pipelineLabel, 18)}${pad(r.count, 4, true)}${pad(money(r.amount), 10, true)}${pad(money(r.weighted), 10, true)}${pad(money(r.quarterWeighted), 10, true)}`),\n  ])}`);\n}\n\nif (CONFIG.SHOW_OWNER_BREAKDOWN && f.byOwner.length) {\n  section(`*Top owners by weighted forecast (${esc(q.label)})*\\n${codeTable([\n    `${pad('Owner', 24)}${pad('#', 4, true)}${pad('Amount', 11, true)}${pad('Weighted', 11, true)}`,\n    ...f.byOwner.map((r) => `${pad(r.ownerName, 24)}${pad(r.count, 4, true)}${pad(money(r.amount), 11, true)}${pad(money(r.weighted), 11, true)}`),\n  ])}`);\n}\n\nif (f.topDeals.length) {\n  const lines = f.topDeals.map((d, i) => {\n    const label = CONFIG.SHOW_DEAL_NAMES ? esc(d.name) : `Deal ${esc(d.id)}`;\n    const linked = CONFIG.HUBSPOT_PORTAL_ID && /^\\d+$/.test(d.id) ? `<https://app.hubspot.com/contacts/${CONFIG.HUBSPOT_PORTAL_ID}/record/0-3/${d.id}|${label}>` : `*${label}*`;\n    const warn = d.flags.includes('past_due') ? ' :warning: past due' : d.flags.includes('stale') ? ' :hourglass: stale' : '';\n    return `${i + 1}. ${linked} — ${money(d.weighted)} weighted (${money(d.amount)} × ${pct(d.probability)}) · ${esc(d.stageLabel)} · closes ${d.closeDate ? dateLabel(d.closeDate) : '—'} · ${esc(d.ownerName)}${warn}`;\n  });\n  section(`*Top ${f.topDeals.length} deals driving ${esc(q.label)}*\\n${lines.join('\\n')}`);\n}\n\nconst r = f.risks;\nconst riskLines = [\n  r.pastDue.count ? `:warning: *${plural(r.pastDue.count, 'past-due deal', 'past-due deals')}* worth ${money(r.pastDue.amount)} (close date already passed${f.meta.pastDueTreatment === 'current_quarter' ? ', still counted in this quarter' : ', excluded from this quarter'})` : null,\n  r.stale.count ? `:hourglass: *${plural(r.stale.count, 'deal', 'deals')}* worth ${money(r.stale.amount)} not updated in ${r.stale.days}+ days` : null,\n  r.missingAmount.count ? `:grey_question: *${plural(r.missingAmount.count, 'open deal has', 'open deals have')}* no amount (counted as ${money(0)})` : null,\n  r.missingCloseDate.count ? `:calendar: *${plural(r.missingCloseDate.count, 'open deal', 'open deals')}* worth ${money(r.missingCloseDate.amount)} ${r.missingCloseDate.count === 1 ? 'has' : 'have'} no close date` : null,\n  r.unknownStage.count ? `:no_entry: *${plural(r.unknownStage.count, 'deal sits', 'deals sit')}* in an unknown stage (weighted at 0%)` : null,\n  r.concentrationTop3 !== null && r.concentrationTop3 >= 0.5 ? `:dart: Top 3 deals make up *${pct(r.concentrationTop3)}* of the weighted forecast` : null,\n].filter(Boolean);\nif (riskLines.length) { divider(); section(`*Forecast hygiene & risk*\\n${riskLines.join('\\n')}`); }\n\ndivider();\ncontext([\n  `*Method:* weighted = Σ amount × stage probability · range = expected ± 1.28σ (independent outcomes) · commit = closed won + deals ≥ ${pct(f.meta.commitProbability)}.`,\n  `${f.totals.count} open deals in a ${f.periods.horizonQuarters}-quarter horizon (${money(f.totals.amount)} total, ${money(f.totals.weighted)} weighted)${f.meta.truncated ? ' · :warning: deal cap reached, totals may be incomplete' : ''}.`,\n  'Estimates only, not financial guidance · n8n forecast bot by dhRobin Systems.',\n].join('\\n'));\n\nconst slackPayload = {\n  text: `${CONFIG.REPORT_TITLE} ${q.label}: weighted ${money(q.weighted)}, projected ${money(q.projected)}${q.target !== null ? ` vs target ${money(q.target)}` : ''}.`,\n  blocks: blocks.slice(0, 50),\n  unfurl_links: false,\n  unfurl_media: false,\n};\n\n// ---------- Idempotency: one live post per ISO week ----------\nconst sd = (() => { try { return $getWorkflowStaticData('global'); } catch (e) { return {}; } })();\nconst alreadyPosted = sd.lastPostedWeekKey === f.snapshot.weekKey && !CONFIG.FORCE_REPOST;\n\nreturn destinations.map((d) => ({ json: {\n  action: EFFECTIVE_DRY_RUN ? 'dry_run_preview' : alreadyPosted ? 'skip_already_posted' : 'post',\n  destination: d.key,\n  weekKey: f.snapshot.weekKey,\n  quarterLabel: q.label,\n  blockCount: slackPayload.blocks.length,\n  mode: { dryRun: EFFECTIVE_DRY_RUN, sandbox: CONFIG.SANDBOX_MODE, source: f.meta.source },\n  headline: slackPayload.text,\n  slackPayload,\n  snapshot: f.snapshot,\n} }));\n"
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000005",
+      "name": "Slack Block Kit Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000095",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "post",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000006",
+      "name": "Should Post?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.destination === 'SECONDARY' ? $env.SLACK_WEBHOOK_URL_SECONDARY : $env.SLACK_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackPayload) }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000007",
+      "name": "Slack Block Kit Publisher",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        -100
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Audit Log — records a successful Slack post and stores the weekly snapshot used for week-over-week deltas.\n// Mode: Run Once for Each Item\nconst post = $('Slack Block Kit Builder').item.json;\n\ntry {\n  const sd = $getWorkflowStaticData('global');\n  sd.lastPostedWeekKey = post.weekKey;\n  sd.snapshots = sd.snapshots || {};\n  sd.snapshots[post.weekKey] = post.snapshot;\n  // Keep the most recent 26 weekly snapshots (about six months).\n  const keys = Object.keys(sd.snapshots).sort().reverse();\n  for (const k of keys.slice(26)) delete sd.snapshots[k];\n} catch (e) { /* static data only persists for production (active) executions */ }\n\nreturn {\n  json: {\n    status: 'posted',\n    destination: post.destination,\n    weekKey: post.weekKey,\n    quarter: post.quarterLabel,\n    headline: post.headline,\n    blockCount: post.blockCount,\n    slackResponse: typeof $json.data === 'string' ? $json.data.slice(0, 50) : 'ok',\n    loggedAt: new Date().toISOString(),\n  },\n};\n"
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000008",
+      "name": "Audit Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Sanitized Error Handler — Slack publisher failures. Never echoes webhook URLs or forecast figures.\n// Mode: Run Once for Each Item\nlet post = {};\ntry { post = $('Slack Block Kit Builder').item.json || {}; } catch (e) { /* lineage unavailable */ }\n\nconst err = $json.error || {};\nconst raw = typeof err === 'string' ? err : (err.message || err.description || 'Slack post failed');\nconst message = String(raw)\n  .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n  .replace(/xox[abprs]-[A-Za-z0-9-]+/g, '[REDACTED_SLACK_TOKEN]')\n  .replace(/Bearer\\s+[A-Za-z0-9\\-_.=]+/gi, 'Bearer [REDACTED]')\n  .slice(0, 200);\nconst httpStatus = Number(err.httpCode || err.status || err.statusCode) || null;\n\nconst HINTS = {\n  400: 'Slack rejected the payload (invalid_blocks / invalid_payload). Paste the dry-run blocks into Block Kit Builder to find the bad block.',\n  403: 'Webhook is not allowed to post (action_prohibited). Check the Slack app installation and workspace policy.',\n  404: 'Webhook or channel not found (no_service / channel_not_found). Re-create the incoming webhook.',\n  410: 'Channel is archived (channel_is_archived). Point the webhook at an active channel.',\n  429: 'Slack rate limit hit. The weekly cadence should never trigger this, so check for repeated manual runs.',\n};\n\nreturn {\n  json: {\n    status: 'slack_post_failed',\n    destination: post.destination || null,\n    weekKey: post.weekKey || null,\n    httpStatus,\n    message,\n    hint: HINTS[httpStatus] || 'Check the n8n execution log and status.slack.com.',\n    loggedAt: new Date().toISOString(),\n  },\n};\n"
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000009",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ $json.status }} ({{ $json.destination }}, {{ $json.weekKey }}) – HTTP {{ $json.httpStatus }}: {{ $json.message }} | {{ $json.hint }}"
+      },
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000010",
+      "name": "Raise Sanitized Error",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "5d3a9c10-7e2f-4b8a-9c1d-3e0000000011",
+      "name": "Dry Run Preview",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        160
+      ]
+    }
+  ],
+  "connections": {
+    "Weekly Monday Cron": {
+      "main": [
+        [
+          {
+            "node": "HubSpot Deal Aggregator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot Deal Aggregator": {
+      "main": [
+        [
+          {
+            "node": "Forecast Calculator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forecast Calculator": {
+      "main": [
+        [
+          {
+            "node": "Slack Block Kit Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Block Kit Builder": {
+      "main": [
+        [
+          {
+            "node": "Should Post?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Post?": {
+      "main": [
+        [
+          {
+            "node": "Slack Block Kit Publisher",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dry Run Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Block Kit Publisher": {
+      "main": [
+        [
+          {
+            "node": "Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Raise Sanitized Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {
+    "HubSpot Deal Aggregator": [
+      {
+        "json": {
+          "meta": {
+            "source": "sandbox_sample",
+            "generatedAt": "2026-11-15T14:08:57.467Z",
+            "dealCount": 13,
+            "closedWonCount": 3,
+            "truncated": false,
+            "amountProperty": "amount_in_home_currency",
+            "sampleTarget": 450000
+          },
+          "periods": {
+            "asOf": "2026-11-16T08:00:00.000Z",
+            "today": "2026-11-16T00:00:00.000Z",
+            "weekKey": "2026-W47",
+            "month": {
+              "start": "2026-11-01T00:00:00.000Z",
+              "end": "2026-11-30T23:59:59.999Z"
+            },
+            "quarter": {
+              "label": "Q4 FY2026",
+              "start": "2026-10-01T00:00:00.000Z",
+              "end": "2026-12-31T23:59:59.999Z"
+            },
+            "nextQuarter": {
+              "label": "Q1 FY2027",
+              "start": "2027-01-01T00:00:00.000Z",
+              "end": "2027-03-31T23:59:59.999Z"
+            },
+            "horizonEnd": "2027-03-31T23:59:59.999Z",
+            "horizonQuarters": 2,
+            "fiscalYearStartMonth": 1
+          },
+          "pipelines": [
+            {
+              "id": "default",
+              "label": "New Business",
+              "displayOrder": 0,
+              "stages": [
+                {
+                  "id": "appointmentscheduled",
+                  "label": "Discovery",
+                  "probability": 0.2,
+                  "displayOrder": 0,
+                  "isClosed": false
+                },
+                {
+                  "id": "qualifiedtobuy",
+                  "label": "Qualified",
+                  "probability": 0.4,
+                  "displayOrder": 1,
+                  "isClosed": false
+                },
+                {
+                  "id": "presentationscheduled",
+                  "label": "Demo / Solution",
+                  "probability": 0.6,
+                  "displayOrder": 2,
+                  "isClosed": false
+                },
+                {
+                  "id": "decisionmakerboughtin",
+                  "label": "Decision Maker Bought-In",
+                  "probability": 0.8,
+                  "displayOrder": 3,
+                  "isClosed": false
+                },
+                {
+                  "id": "contractsent",
+                  "label": "Contract Sent",
+                  "probability": 0.9,
+                  "displayOrder": 4,
+                  "isClosed": false
+                },
+                {
+                  "id": "closedwon",
+                  "label": "Closed Won",
+                  "probability": 1,
+                  "displayOrder": 5,
+                  "isClosed": true
+                },
+                {
+                  "id": "closedlost",
+                  "label": "Closed Lost",
+                  "probability": 0,
+                  "displayOrder": 6,
+                  "isClosed": true
+                }
+              ]
+            },
+            {
+              "id": "PIPELINE_ID_RENEWALS",
+              "label": "Renewals",
+              "displayOrder": 1,
+              "stages": [
+                {
+                  "id": "STAGE_ID_RENEWAL_OPEN",
+                  "label": "Renewal Open",
+                  "probability": 0.5,
+                  "displayOrder": 0,
+                  "isClosed": false
+                },
+                {
+                  "id": "STAGE_ID_RENEWAL_NEGOTIATION",
+                  "label": "Negotiation",
+                  "probability": 0.75,
+                  "displayOrder": 1,
+                  "isClosed": false
+                },
+                {
+                  "id": "STAGE_ID_RENEWAL_COMMITTED",
+                  "label": "Verbally Committed",
+                  "probability": 0.9,
+                  "displayOrder": 2,
+                  "isClosed": false
+                },
+                {
+                  "id": "STAGE_ID_RENEWAL_WON",
+                  "label": "Renewed",
+                  "probability": 1,
+                  "displayOrder": 3,
+                  "isClosed": true
+                },
+                {
+                  "id": "STAGE_ID_RENEWAL_LOST",
+                  "label": "Churned",
+                  "probability": 0,
+                  "displayOrder": 4,
+                  "isClosed": true
+                }
+              ]
+            }
+          ],
+          "deals": [
+            {
+              "id": "SMP-1001",
+              "name": "Alpha Ltd - Platform (fictional)",
+              "amount": 120000,
+              "closeDate": "2026-12-15T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "contractsent",
+              "ownerId": "OWNER_ID_1",
+              "dealProbability": null,
+              "lastModified": "2026-11-13T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-1002",
+              "name": "Bravo Inc - Expansion (fictional)",
+              "amount": 85000,
+              "closeDate": "2026-11-28T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "decisionmakerboughtin",
+              "ownerId": "OWNER_ID_2",
+              "dealProbability": null,
+              "lastModified": "2026-11-12T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-1003",
+              "name": "Charlie GmbH - Pilot (fictional)",
+              "amount": 40000,
+              "closeDate": "2026-11-05T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "presentationscheduled",
+              "ownerId": "OWNER_ID_1",
+              "dealProbability": null,
+              "lastModified": "2026-10-01T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-1004",
+              "name": "Delta Co - Enterprise (fictional)",
+              "amount": 250000,
+              "closeDate": "2026-12-20T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "qualifiedtobuy",
+              "ownerId": "OWNER_ID_3",
+              "dealProbability": null,
+              "lastModified": "2026-11-10T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-1005",
+              "name": "Echo Partners - Starter (fictional)",
+              "amount": 18000,
+              "closeDate": "2026-12-05T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "appointmentscheduled",
+              "ownerId": "OWNER_ID_2",
+              "dealProbability": null,
+              "lastModified": "2026-11-14T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-1006",
+              "name": "Foxtrot Labs - Platform (fictional)",
+              "amount": 95000,
+              "closeDate": "2027-01-30T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "presentationscheduled",
+              "ownerId": "OWNER_ID_3",
+              "dealProbability": null,
+              "lastModified": "2026-11-09T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-1007",
+              "name": "Golf Health - Analytics (fictional)",
+              "amount": 60000,
+              "closeDate": "2027-02-15T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "qualifiedtobuy",
+              "ownerId": "OWNER_ID_1",
+              "dealProbability": null,
+              "lastModified": "2026-10-20T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-1008",
+              "name": "Hotel Retail - Rollout (fictional)",
+              "amount": null,
+              "closeDate": "2026-12-10T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "appointmentscheduled",
+              "ownerId": "OWNER_ID_2",
+              "dealProbability": null,
+              "lastModified": "2026-11-11T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-1009",
+              "name": "India Logistics - Suite (fictional)",
+              "amount": 70000,
+              "closeDate": null,
+              "pipelineId": "default",
+              "stageId": "qualifiedtobuy",
+              "ownerId": "OWNER_ID_3",
+              "dealProbability": null,
+              "lastModified": "2026-11-02T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-1010",
+              "name": "Juliet Media - Add-on (fictional)",
+              "amount": 22000,
+              "closeDate": "2026-11-30T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "contractsent",
+              "ownerId": "OWNER_ID_1",
+              "dealProbability": null,
+              "lastModified": "2026-11-15T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-2001",
+              "name": "Kilo Systems - Renewal (fictional)",
+              "amount": 48000,
+              "closeDate": "2026-12-31T00:00:00.000Z",
+              "pipelineId": "PIPELINE_ID_RENEWALS",
+              "stageId": "STAGE_ID_RENEWAL_NEGOTIATION",
+              "ownerId": "OWNER_ID_2",
+              "dealProbability": null,
+              "lastModified": "2026-11-06T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-2002",
+              "name": "Lima Energy - Renewal (fictional)",
+              "amount": 36000,
+              "closeDate": "2026-11-20T00:00:00.000Z",
+              "pipelineId": "PIPELINE_ID_RENEWALS",
+              "stageId": "STAGE_ID_RENEWAL_COMMITTED",
+              "ownerId": "OWNER_ID_3",
+              "dealProbability": null,
+              "lastModified": "2026-11-13T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-2003",
+              "name": "Mike Foods - Renewal (fictional)",
+              "amount": 30000,
+              "closeDate": "2027-03-15T00:00:00.000Z",
+              "pipelineId": "PIPELINE_ID_RENEWALS",
+              "stageId": "STAGE_ID_RENEWAL_OPEN",
+              "ownerId": "OWNER_ID_1",
+              "dealProbability": null,
+              "lastModified": "2026-11-03T12:00:00.000Z",
+              "lastActivity": null
+            }
+          ],
+          "closedWon": [
+            {
+              "id": "SMP-3001",
+              "name": "Oscar Bank - Platform (fictional)",
+              "amount": 110000,
+              "closeDate": "2026-10-14T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "closedwon",
+              "ownerId": "OWNER_ID_1",
+              "dealProbability": null,
+              "lastModified": "2026-10-14T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-3002",
+              "name": "Papa Telecom - Renewal (fictional)",
+              "amount": 42000,
+              "closeDate": "2026-10-28T00:00:00.000Z",
+              "pipelineId": "PIPELINE_ID_RENEWALS",
+              "stageId": "STAGE_ID_RENEWAL_WON",
+              "ownerId": "OWNER_ID_2",
+              "dealProbability": null,
+              "lastModified": "2026-10-28T12:00:00.000Z",
+              "lastActivity": null
+            },
+            {
+              "id": "SMP-3003",
+              "name": "Quebec Edu - Starter (fictional)",
+              "amount": 15000,
+              "closeDate": "2026-11-09T00:00:00.000Z",
+              "pipelineId": "default",
+              "stageId": "closedwon",
+              "ownerId": "OWNER_ID_3",
+              "dealProbability": null,
+              "lastModified": "2026-11-09T12:00:00.000Z",
+              "lastActivity": null
+            }
+          ],
+          "owners": {
+            "OWNER_ID_1": "Owner A (placeholder)",
+            "OWNER_ID_2": "Owner B (placeholder)",
+            "OWNER_ID_3": "Owner C (placeholder)"
+          },
+          "previousSnapshot": {
+            "weekKey": "2026-W46",
+            "asOf": "2026-11-09T08:00:00.000Z",
+            "quarterLabel": "Q4 FY2026",
+            "quarterWeighted": 372500,
+            "openAmount": 812000,
+            "openCount": 12,
+            "closedWonQTD": 152000
+          }
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "00000000-0000-4000-8000-0000000000c1",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "REPLACE_WITH_YOUR_INSTANCE_ID_OR_REMOVE"
+  },
+  "tags": []
+}
